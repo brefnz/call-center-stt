@@ -75,7 +75,7 @@ def kb_get(article_id: str):
 
 def kb_create(title: str, content: str, tags=None, category: str = None) -> dict:
     article_id = str(uuid.uuid4())
-    with get_conn() as conn:
+    with _lock, get_conn() as conn:
         conn.execute(
             "INSERT INTO kb_articles (id, title, content, tags, category, updated_at) "
             "VALUES (?, ?, ?, ?, ?, ?)",
@@ -101,13 +101,13 @@ def kb_update(article_id: str, **fields) -> dict | None:
     sets.append("updated_at = ?")
     params.append(_now())
     params.append(article_id)
-    with get_conn() as conn:
+    with _lock, get_conn() as conn:
         conn.execute(f"UPDATE kb_articles SET {', '.join(sets)} WHERE id = ?", params)
     return kb_get(article_id)
 
 
 def kb_delete(article_id: str) -> bool:
-    with get_conn() as conn:
+    with _lock, get_conn() as conn:
         cur = conn.execute("DELETE FROM kb_articles WHERE id = ?", (article_id,))
         return cur.rowcount > 0
 
@@ -115,8 +115,17 @@ def kb_delete(article_id: str) -> bool:
 # ---------- Call transcripts ----------
 
 def transcript_add(call_id: str, speaker: str, text: str, kb_suggested_ids=None) -> dict:
+    # FIX: sebelumnya _lock ini dideklarasikan tapi TIDAK PERNAH dipakai.
+    # Selama transcript_add() dipanggil satu-satu di event loop, itu masih
+    # "aman" secara kebetulan. Tapi sekarang (lihat fix di pipeline.py)
+    # fungsi ini dipanggil lewat run_in_executor, artinya beberapa
+    # panggilan bisa jalan di THREAD BERBEDA secara bersamaan (mis. leg
+    # agent & customer ngomong nyaris bersamaan, atau dua call beda
+    # sedang berlangsung). Tanpa lock, tulis-menulis bersamaan ke file
+    # SQLite yang sama bisa nabrak dan lempar
+    # `sqlite3.OperationalError: database is locked`.
     row_id = str(uuid.uuid4())
-    with get_conn() as conn:
+    with _lock, get_conn() as conn:
         conn.execute(
             "INSERT INTO call_transcripts (id, call_id, speaker, text, ts, kb_suggested_ids) "
             "VALUES (?, ?, ?, ?, ?, ?)",

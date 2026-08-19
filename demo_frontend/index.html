@@ -23,10 +23,18 @@
 
   <script src="kb-sidebar-widget.js"></script>
   <script>
-    // GANTI dua nilai ini sesuai environment production nanti:
+    // backendBaseUrl dipakai dari origin halaman ini sendiri (window.location.origin)
+    // -- karena halaman ini di-serve LANGSUNG oleh backend FastAPI (lihat
+    // app/main.py: app.mount("/demo", ...)), origin-nya otomatis SAMA PERSIS
+    // dengan backend. Tidak perlu ganti-ganti host manual lagi, dan tidak
+    // ada resiko mixed content (http vs https) karena keduanya satu origin.
+    //
+    // Kalau nanti widget ini dipasang di CRM yang benar-benar terpisah
+    // domainnya dari backend, baru backendBaseUrl perlu diisi manual ke
+    // URL backend production (dan pastikan skema https/wss-nya cocok).
     KbSidebarWidget.init({
       containerId: "kb-sidebar",
-      backendBaseUrl: "http://localhost:8000", // ganti ke IP/host server produksi
+      backendBaseUrl: window.location.origin,
       agentExtension: "202", // ganti: ambil dari sesi login agent yang sedang aktif di CRM
     });
   </script>

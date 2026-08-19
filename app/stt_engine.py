@@ -23,6 +23,34 @@ from app.config import settings
 
 logger = logging.getLogger("stt_engine")
 
+# Frasa yang sudah dikenal luas sebagai "halusinasi" khas Whisper saat
+# dikasih audio nyaris diam/noise (dilatih dari banyak data YouTube, jadi
+# suka ngarang kalimat penutup video kayak gini). Dicocokkan longgar
+# (lowercase, tanda baca dibuang) supaya varian kecil tetap ke-tangkep.
+_HALLUCINATION_PHRASES = [
+    "terima kasih telah menonton",
+    "terima kasih kerana menonton",
+    "terima kasih karena telah menonton",
+    "terima kasih sudah menonton",
+    "jangan lupa like dan subscribe",
+    "sampai jumpa di video selanjutnya",
+    "terima kasih",  # kalau ini SATU-SATUNYA isi segmen (lihat _looks_like_hallucination)
+]
+
+
+def _looks_like_hallucination(text: str) -> bool:
+    """
+    Cek longgar apakah teks ini kemungkinan besar halusinasi Whisper,
+    bukan ucapan customer/agent beneran. Sengaja hanya cocok kalau teksnya
+    PENDEK dan MIRIP PERSIS salah satu frasa umum ini -- supaya kalimat
+    panjang yang KEBETULAN mengandung kata "terima kasih" (mis. "terima
+    kasih pak, saya mau tanya soal tagihan") tetap lolos apa adanya.
+    """
+    normalized = text.strip().lower().rstrip(".!?, ")
+    if len(normalized) > 40:
+        return False  # terlalu panjang untuk jadi false positive dari frasa pendek di atas
+    return normalized in _HALLUCINATION_PHRASES
+
 
 class STTEngine:
     def __init__(self):
@@ -65,9 +93,39 @@ class STTEngine:
             language=settings.STT_LANGUAGE,
             vad_filter=False,  # VAD sudah dilakukan sebelumnya di audio_capture.py
             beam_size=beam_size,
+            # PENTING (fix halusinasi "terima kasih karena telah menonton"
+            # dkk): Whisper dilatih dari banyak data YouTube, jadi kalau
+            # dikasih segmen yang SEBENARNYA nyaris diam/noise (VAD kita
+            # kadang masih meloloskan sedikit residual noise/dengung line
+            # telepon), dia suka "ngarang" kalimat penutup video seperti
+            # itu -- bug yang sudah terkenal luas di komunitas Whisper,
+            # bukan cuma di sini.
+            #
+            # condition_on_previous_text=False: jangan pakai transkrip
+            # segmen SEBELUMNYA sebagai konteks. Kalau dibiarkan default
+            # (True), begitu SEKALI halusinasi muncul, dia cenderung
+            # "keterusan" halu di segmen-segmen berikutnya juga karena ikut
+            # kekontaminasi konteks yang salah.
+            condition_on_previous_text=False,
         )
-        text = " ".join(seg.text.strip() for seg in segments).strip()
-        return text
+
+        parts = []
+        for seg in segments:
+            text = seg.text.strip()
+            if not text:
+                continue
+            # no_speech_prob tinggi = model sendiri menganggap segmen ini
+            # KEMUNGKINAN BESAR bukan ucapan sama sekali (diam/noise) --
+            # buang, jangan sampai teks ngarang ini lolos ke KB search/DB.
+            if getattr(seg, "no_speech_prob", 0.0) > 0.6:
+                logger.info("Buang segmen (no_speech_prob=%.2f): %r", seg.no_speech_prob, text)
+                continue
+            if _looks_like_hallucination(text):
+                logger.info("Buang segmen (terdeteksi pola halusinasi umum): %r", text)
+                continue
+            parts.append(text)
+
+        return " ".join(parts).strip()
 
     def transcribe_wav_file(self, path: str) -> str:
         """Helper untuk testing offline (lihat scripts/test_pipeline_offline.py)."""

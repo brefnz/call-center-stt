@@ -98,17 +98,33 @@ async def process_transcript_text(call_id: str, speaker: str, text: str):
     Bagian ini dipisah dari process_audio_segment supaya bisa dipanggil
     langsung dengan teks (mis. dari script testing) tanpa perlu audio.
     """
+    # PENTING: kb_search_engine.search() (TF-IDF + cosine similarity) dan
+    # db.transcript_add() (buka koneksi SQLite + INSERT + commit/fsync)
+    # SAMA-SAMA blocking/sinkron. Kalau dipanggil langsung di sini (event
+    # loop asyncio), keduanya mem-block event loop -- ini PERSIS pola bug
+    # yang sama yang sebelumnya bikin faster-whisper & sherpa-onnx harus
+    # dipindah ke run_in_executor (lihat komentar di process_audio_segment
+    # & ari_client._process_live_audio): event loop yang sibuk bikin
+    # ping/pong WebSocket ke client (panel Epic) telat, sehingga koneksi
+    # dianggap putus dan client reconnect terus-menerus selama panggilan
+    # berlangsung. Dua panggilan ini kelewatan waktu itu -- dibungkus di
+    # sini supaya event loop tetap responsif.
+    loop = asyncio.get_event_loop()
+
     # Sesuai PRD Bab 7.4: KB search idealnya hanya dipicu oleh ucapan
     # pelanggan, bukan ucapan agent sendiri.
     kb_results = []
     if speaker == "customer":
-        kb_results = kb_search_engine.search(text)
+        kb_results = await loop.run_in_executor(None, kb_search_engine.search, text)
 
-    row = db.transcript_add(
-        call_id=call_id,
-        speaker=speaker,
-        text=text,
-        kb_suggested_ids=[r["id"] for r in kb_results],
+    row = await loop.run_in_executor(
+        None,
+        lambda: db.transcript_add(
+            call_id=call_id,
+            speaker=speaker,
+            text=text,
+            kb_suggested_ids=[r["id"] for r in kb_results],
+        ),
     )
 
     await ws_manager.broadcast(call_id, {

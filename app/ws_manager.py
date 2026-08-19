@@ -56,5 +56,26 @@ class ConnectionManager:
         for ws in dead:
             self.disconnect(call_id, ws)
 
+    # FIX: sebelumnya tidak ada cara buat BACKEND inisiatif nutup koneksi
+    # client saat call beneran selesai -- disconnect() cuma dipanggil kalau
+    # client sendiri yang mutusin. Akibatnya widget di sisi Epic/CRM tidak
+    # pernah dapat event `onclose`, dan status di UI-nya nyangkut
+    # "terhubung" terus meski panggilan sudah berakhir.
+    #
+    # Dipanggil dari app/ari_client.py tepat saat StasisEnd/ChannelDestroyed
+    # diterima untuk call itu, SETELAH mapping agent->call_id dihapus (lihat
+    # komentar FIX di ari_client.py) supaya tidak ada window balapan dengan
+    # polling /active-call.
+    async def close_call(self, call_id: str, code: int = 1000, reason: str = "call_ended"):
+        """Tutup semua koneksi WebSocket yang lagi subscribe ke call_id ini."""
+        conns = list(self._connections.get(call_id, []))
+        for ws in conns:
+            try:
+                await ws.close(code=code, reason=reason)
+            except Exception:
+                logger.warning("Gagal menutup WebSocket untuk call_id=%s", call_id)
+            finally:
+                self.disconnect(call_id, ws)
+
 
 ws_manager = ConnectionManager()

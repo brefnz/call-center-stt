@@ -32,6 +32,7 @@ from app.audio_capture import RTPReceiver, port_allocator
 from app.config import settings
 from app.pipeline import process_audio_segment, broadcast_live_transcript
 from app.sherpa_engine import LiveRecognizer
+from app.ws_manager import ws_manager  # FIX: dipakai buat nutup ws client saat call selesai
 
 logger = logging.getLogger("ari_client")
 
@@ -294,11 +295,23 @@ async def _handle_event(event: dict):
         session = _sessions.pop(channel_id, None)
         if session:
             logger.info("Panggilan selesai, membersihkan resource call_id=%s", channel_id)
-            await session.stop()
-            # Bersihkan juga mapping agent -> call_id kalau ini call yang sedang aktif
+
+            # FIX: hapus mapping agent->call_id DULU, SEBELUM await apapun
+            # (jadi dijamin sudah hilang sebelum kode lain sempat jalan).
+            # Ini yang bikin endpoint /active-call langsung berhenti
+            # ngarahin polling ke call yang baru saja berakhir ini.
             for ext, active_call_id in list(_agent_active_call.items()):
                 if active_call_id == channel_id:
                     del _agent_active_call[ext]
+
+            await session.stop()
+
+            # FIX: ini bagian yang sebelumnya HILANG -- tanpa baris ini,
+            # WebSocket ke widget/Epic (/ws/{channel_id}) tidak pernah
+            # ditutup dari sisi backend, jadi widget tidak pernah dapat
+            # event `onclose` dan statusnya nyangkut "terhubung" terus
+            # meskipun panggilan sudah benar-benar selesai.
+            await ws_manager.close_call(channel_id)
 
 
 async def run_ari_listener():

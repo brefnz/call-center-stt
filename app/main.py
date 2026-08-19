@@ -15,8 +15,11 @@ import asyncio
 import logging
 from contextlib import asynccontextmanager
 
+from pathlib import Path
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
 
 from app import db
 from app.ari_client import run_ari_listener
@@ -69,6 +72,14 @@ app.add_middleware(
 
 app.include_router(kb.router)
 app.include_router(calls.router)
+
+# Serve halaman demo ticketing + widget JS langsung dari server yang sama
+# (http://localhost:8000/demo/index.html) supaya testing tidak perlu Live
+# Server/dev-server terpisah lagi -- ini juga menghilangkan resiko mixed
+# content, karena origin backend & frontend jadi PERSIS SAMA.
+_DEMO_FRONTEND_DIR = Path(__file__).resolve().parent.parent / "demo_frontend"
+if _DEMO_FRONTEND_DIR.is_dir():
+    app.mount("/demo", StaticFiles(directory=str(_DEMO_FRONTEND_DIR), html=True), name="demo")
 
 
 @app.get("/health")
