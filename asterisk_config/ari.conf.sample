@@ -1,0 +1,14 @@
+; /etc/asterisk/ari.conf (atau lewat FreePBX GUI: Settings > Asterisk REST Interface Users
+; kalau modul FreePBX tersedia, kalau tidak edit manual file ini lalu restart Asterisk)
+;
+; Username/password ini harus sama dengan ARI_USERNAME / ARI_PASSWORD di file .env aplikasi.
+
+[general]
+enabled = yes
+pretty = yes
+allowed_origins = *
+
+[stt_kb_app]
+type = user
+password = change_me
+password_format = plain

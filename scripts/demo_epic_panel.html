@@ -1,0 +1,56 @@
+<!DOCTYPE html>
+<html lang="id">
+<head>
+<meta charset="UTF-8">
+<title>Demo Panel KB (simulasi tampilan di Epic)</title>
+<style>
+  body { font-family: sans-serif; max-width: 640px; margin: 40px auto; }
+  #transcript { background: #f4f4f4; padding: 12px; border-radius: 8px; min-height: 80px; white-space: pre-wrap; }
+  .kb-card { border: 1px solid #ddd; border-radius: 8px; padding: 10px 14px; margin: 8px 0; }
+  .kb-card h4 { margin: 0 0 6px; }
+  .score { color: #888; font-size: 12px; }
+  input, button { font-size: 14px; padding: 6px 10px; }
+</style>
+</head>
+<body>
+  <h2>Demo panel KB (simulasi sisi Epic)</h2>
+  <p>
+    Call ID:
+    <input id="callId" value="demo-call-1">
+    <button onclick="connect()">Connect</button>
+  </p>
+
+  <h3>Transkrip</h3>
+  <div id="transcript"></div>
+
+  <h3>Saran Knowledge Base</h3>
+  <div id="kb"></div>
+
+<script>
+function connect() {
+  const callId = document.getElementById('callId').value;
+  const ws = new WebSocket(`ws://${location.hostname}:8000/ws/${callId}`);
+  const transcriptEl = document.getElementById('transcript');
+  const kbEl = document.getElementById('kb');
+
+  ws.onopen = () => { transcriptEl.textContent += `[terhubung ke call ${callId}]\n`; };
+  ws.onmessage = (msg) => {
+    const event = JSON.parse(msg.data);
+    if (event.type === 'transcript') {
+      transcriptEl.textContent += `[${event.speaker}] ${event.text}\n`;
+      transcriptEl.scrollTop = transcriptEl.scrollHeight;
+    } else if (event.type === 'kb_suggestions') {
+      kbEl.innerHTML = '';
+      event.suggestions.forEach(s => {
+        const div = document.createElement('div');
+        div.className = 'kb-card';
+        div.innerHTML = `<h4>${s.title}</h4><div class="score">skor: ${s.score}</div><div>${s.content}</div>`;
+        kbEl.appendChild(div);
+      });
+    }
+  };
+  ws.onclose = () => { transcriptEl.textContent += '[koneksi ditutup]\n'; };
+}
+</script>
+</body>
+</html>

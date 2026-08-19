@@ -1,0 +1,10 @@
+; /etc/asterisk/http.conf
+; ARI berjalan di atas Asterisk built-in HTTP server, jadi ini wajib enabled.
+; Di FreePBX v17, biasanya sudah otomatis enabled untuk kebutuhan modul lain
+; (mis. UCP) - tinggal pastikan bindaddr/port sesuai dan bisa diakses oleh
+; server aplikasi STT+KB kita (app/config.py -> ARI_BASE_URL).
+
+[general]
+enabled = yes
+bindaddr = 0.0.0.0
+bindport = 8088

@@ -1,0 +1,65 @@
+# ================= Secrets & config =================
+.env
+.env.*
+!.env.example
+*.key
+*api_key*
+credentials.json
+
+# ================= Python =================
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+dist/
+*.egg-info/
+.eggs/
+venv/
+env/
+.venv/
+ENV/
+
+# ================= Model & weight files (BESAR, jangan masuk git) =================
+# Model ONNX / faster-whisper (CTranslate2) / PyTorch / HuggingFace cache
+*.onnx
+*.onnx.data
+*.bin
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+*.gguf
+models/
+checkpoints/
+weights/
+.cache/
+~/.cache/huggingface/
+
+# CTranslate2 converted model folder (biasanya berisi model.bin + config)
+ct2_model/
+whisper_ct2/
+
+# ================= Audio & data (bisa besar & berisi data pelanggan) =================
+*.wav
+*.mp3
+*.flac
+*.pcm
+*.raw
+recordings/
+audio_samples/
+data/*.db
+data/*.sqlite
+data/*.sqlite3
+*.log
+
+# ================= OS / editor =================
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+
+# ================= Jupyter =================
+.ipynb_checkpoints/
