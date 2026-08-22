@@ -24,6 +24,7 @@ from fastapi.staticfiles import StaticFiles
 from app import db
 from app.ari_client import run_ari_listener
 from app.routers import calls, kb
+from app.stt_engine import get_stt_engine
 
 logging.basicConfig(
     level=logging.INFO,
@@ -39,6 +40,24 @@ async def lifespan(app: FastAPI):
     global _ari_task
     db.init_db()
     logger.info("Database siap.")
+
+    # PENTING: load model faster-whisper DI SINI (startup), BUKAN lazy
+    # pas panggilan pertama masuk. Loading model itu proses BERAT &
+    # BLOCKING (bisa beberapa detik, apalagi kalau masih perlu download).
+    # Kalau dibiarkan lazy, dia akan ke-trigger dari DALAM event handler
+    # ARI (app/ari_client.py: _setup_capture_for_channel) yang jalan di
+    # event loop yang SAMA dengan listener WebSocket ARI -- selama model
+    # loading, event loop gak bisa balas ping dari Asterisk (bikin ARI
+    # WebSocket dianggap mati/reconnect) DAN event ARI yang masuk PAS
+    # momen itu (mis. ChannelStateChange ke "Up" saat agent jawab telpon)
+    # bisa KELEWAT sama sekali kalau reconnect terjadi di waktu bersamaan
+    # -- akibatnya capture untuk panggilan itu tidak pernah dimulai.
+    # run_in_executor supaya loading (walau lama) tidak memblokir event
+    # loop startup FastAPI itu sendiri.
+    logger.info("Memuat model faster-whisper di awal (supaya tidak blocking saat panggilan pertama masuk) ...")
+    loop = asyncio.get_event_loop()
+    await loop.run_in_executor(None, get_stt_engine)
+    logger.info("Model faster-whisper siap.")
 
     try:
         _ari_task = asyncio.create_task(run_ari_listener())

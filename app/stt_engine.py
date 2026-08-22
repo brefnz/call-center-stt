@@ -15,6 +15,7 @@ import io
 import logging
 import threading
 import wave
+import time
 
 import numpy as np
 from faster_whisper import WhisperModel
@@ -74,19 +75,27 @@ class STTEngine:
             num_workers=settings.STT_NUM_WORKERS,
         )
 
-    def transcribe_pcm16(self, pcm_bytes: bytes, sample_rate: int = 16000, beam_size: int = 5) -> str:
+    def _raw_transcribe(self, audio_np: np.ndarray, beam_size: int, sample_rate: int = 16000) -> str:
         """
-        Transkripsi satu segmen audio PCM 16-bit mono (hasil VAD) menjadi teks.
+        Inti transkripsi, terima audio yang SUDAH dalam bentuk float32
+        [-1, 1] (dipakai bersama oleh transcribe_pcm16 dan StreamingSession
+        supaya logic hallucination-filtering tidak terduplikasi).
 
-        beam_size lebih kecil = lebih cepat tapi sedikit kurang akurat.
-        Dipakai beam_size=1 (greedy, tercepat) untuk transkrip INTERIM/
-        sementara (lihat pipeline.py: process_interim_audio_segment), dan
-        beam_size default (5) untuk transkrip FINAL yang lebih diutamakan
-        akurat karena itu yang dipakai KB search & disimpan ke DB.
+        FIX: sebelumnya ada blok pengukuran waktu (time.perf_counter() +
+        logger.info("WHISPER: ...")) yang DITARUH SETELAH `return` di
+        fungsi ini -- jadi itu kode MATI, gak pernah kejalanin sama
+        sekali. Selama ini gak ada angka pasti soal seberapa lambat
+        whisper beneran jalan di server. Sekarang pengukurannya beneran
+        jalan (dan sekalian dihitung RTF -- real-time factor -- biar
+        langsung kelihatan apakah CPU "kekejar" kecepatan bicara orang
+        atau enggak: RTF < 1 berarti lebih cepat dari real-time/aman,
+        RTF > 1 berarti proses lebih lambat dari lama ucapannya sendiri,
+        alias makin lama makin nge-lag/numpuk).
         """
-        if not pcm_bytes:
+        if audio_np.size == 0:
             return ""
-        audio_np = np.frombuffer(pcm_bytes, dtype=np.int16).astype(np.float32) / 32768.0
+
+        start = time.perf_counter()
 
         segments, _info = self._model.transcribe(
             audio_np,
@@ -125,7 +134,30 @@ class STTEngine:
                 continue
             parts.append(text)
 
-        return " ".join(parts).strip()
+        result = " ".join(parts).strip()
+
+        elapsed = time.perf_counter() - start
+        duration = audio_np.size / sample_rate
+        rtf = (elapsed / duration) if duration > 0 else 0.0
+        logger.info(
+            "WHISPER: audio=%.2fs beam=%d inference=%.3fs RTF=%.2fx%s -> %r",
+            duration, beam_size, elapsed, rtf,
+            " [LEBIH LAMBAT DARI REAL-TIME]" if rtf > 1.0 else "",
+            result,
+        )
+
+        return result
+
+    def transcribe_pcm16(self, pcm_bytes: bytes, sample_rate: int = 16000, beam_size: int = 5) -> str:
+        """
+        Transkripsi satu segmen audio PCM 16-bit mono (hasil VAD) menjadi teks.
+
+        beam_size lebih kecil = lebih cepat tapi sedikit kurang akurat.
+        """
+        if not pcm_bytes:
+            return ""
+        audio_np = np.frombuffer(pcm_bytes, dtype=np.int16).astype(np.float32) / 32768.0
+        return self._raw_transcribe(audio_np, beam_size=beam_size, sample_rate=sample_rate)
 
     def transcribe_wav_file(self, path: str) -> str:
         """Helper untuk testing offline (lihat scripts/test_pipeline_offline.py)."""
@@ -134,6 +166,118 @@ class STTEngine:
             pcm_bytes = wf.readframes(wf.getnframes())
             sample_rate = wf.getframerate()
         return self.transcribe_pcm16(pcm_bytes, sample_rate)
+
+
+class StreamingSession:
+    """
+    Transkrip real-time SATU speaker (agent ATAU customer) dalam satu
+    panggilan, pakai SATU model faster-whisper -- pengganti kombinasi lama
+    sherpa-onnx (preview cepat tapi cuma tebak fonem, gak akurat) +
+    faster-whisper (final, tapi diproses ULANG dari nol setelah preview,
+    kerja dobel).
+
+    IDE DASARNYA (diadaptasi dari teknik "local agreement" a.k.a.
+    whisper_streaming, Machacek dkk. 2023 -- disederhanakan karena kita
+    SUDAH punya batas ucapan yang jelas dari VAD, beda dari paper aslinya
+    yang menyasar audio panjang tanpa batas):
+
+      1. Selama speaker masih ngomong, `feed()` dipanggil terus per frame
+         kecil (~20ms). Tiap sudah kekumpul ~STT_STREAM_CHUNK_SECONDS
+         detik audio BARU, seluruh buffer (dari awal ucapan ini) di-
+         transkrip ulang pakai beam_size=1 (greedy, PALING cepat) --
+         hasilnya dikirim sebagai preview yang terus "nyempurna"
+         (mis. "halo" -> "halo selamat" -> "halo selamat pagi").
+      2. Begitu VAD bilang speaker BERHENTI ngomong (akhir ucapan),
+         `finalize()` dipanggil SEKALI dengan audio final dari VAD --
+         transkrip ulang TERAKHIR kali pakai beam_size lebih besar
+         (settings.STT_BEAM_SIZE) untuk hasil paling akurat, itulah yang
+         disimpan sebagai transkrip FINAL (masuk DB + KB search).
+
+    Kenapa ini LEBIH RINGAN dibanding sherpa+whisper terpisah, padahal
+    sama-sama "transcribe berkali-kali": preview pakai beam_size=1 pada
+    buffer yang pendek (durasi satu ucapan, biasanya beberapa detik --
+    bukan seluruh panggilan), dan re-run cuma tiap STT_STREAM_CHUNK_SECONDS
+    (bukan tiap frame 20ms kayak sherpa) -- jadi total kerja CPU-nya jauh
+    lebih kecil dibanding menjalankan DUA model penuh (sherpa tiap frame +
+    whisper penuh di akhir).
+
+    FIX: sebelumnya buffer `_audio` di sini TIDAK ADA batas panjangnya
+    sama sekali -- kalau speaker ngomong panjang tanpa jeda, tiap
+    STT_STREAM_CHUNK_SECONDS whisper harus re-transcribe SELURUH audio
+    dari awal ucapan itu, makin lama makin berat (biaya CPU per re-run
+    tumbuh terus, bisa bikin proses ketinggalan jauh dari kecepatan orang
+    ngomong). Sekarang buffer dipotong ke STT_STREAM_MAX_BUFFER_SECONDS
+    detik TERAKHIR sebelum tiap re-run -- preview mungkin "lupa" kata di
+    awal kalimat yang SANGAT panjang, tapi biaya re-transcribe-nya jadi
+    konstan. Ini tidak memengaruhi hasil FINAL (finalize() tetap pakai
+    audio utuh dari VAD, bukan buffer internal ini).
+    """
+
+    def __init__(self, engine: "STTEngine", sample_rate: int = 16000):
+        self._engine = engine
+        self._sample_rate = sample_rate
+        self._audio = np.zeros(0, dtype=np.float32)
+        self._samples_since_last_run = 0
+        self._min_chunk_samples = int(settings.STT_STREAM_CHUNK_SECONDS * sample_rate)
+        self._max_buffer_samples = int(settings.STT_STREAM_MAX_BUFFER_SECONDS * sample_rate)
+
+    def feed(self, pcm_bytes: bytes) -> str:
+        """
+        Terima potongan audio PCM16 kecil (dipanggil terus selama speaker
+        ngomong). Return teks preview TERBARU (menggantikan preview
+        sebelumnya, BUKAN ditambahkan) kalau baru saja re-run, atau ""
+        kalau belum cukup audio baru untuk re-run lagi (supaya caller
+        tahu kapan HARUS broadcast update, dan kapan tidak perlu).
+        """
+        if not pcm_bytes:
+            return ""
+        chunk = np.frombuffer(pcm_bytes, dtype=np.int16).astype(np.float32) / 32768.0
+        self._audio = np.concatenate([self._audio, chunk])
+        self._samples_since_last_run += len(chunk)
+
+        if self._samples_since_last_run < self._min_chunk_samples:
+            return ""
+        self._samples_since_last_run = 0
+
+        # FIX: pangkas buffer ke N detik terakhir SEBELUM re-transcribe,
+        # supaya biaya greedy-decode gak terus membengkak di kalimat
+        # panjang tanpa jeda (lihat catatan FIX di docstring class ini).
+        if len(self._audio) > self._max_buffer_samples:
+            self._audio = self._audio[-self._max_buffer_samples:]
+            logger.info(
+                "StreamingSession: buffer preview dipangkas ke %.1fs (kalimat panjang tanpa jeda)",
+                settings.STT_STREAM_MAX_BUFFER_SECONDS,
+            )
+
+        try:
+            return self._engine._raw_transcribe(self._audio, beam_size=1, sample_rate=self._sample_rate)
+        except Exception:
+            logger.exception("Gagal transcribe preview streaming")
+            return ""
+
+    def finalize(self, final_pcm_bytes: bytes) -> str:
+        """
+        Dipanggil SEKALI saat VAD mendeteksi ucapan selesai. Transkrip
+        ULANG dari audio final yang dikasih VAD (BUKAN dari buffer
+        internal `feed()` -- audio dari VAD itu otoritatif/lengkap, jadi
+        lebih aman dipakai langsung daripada mengandalkan akumulasi
+        internal yang timing-nya bisa sedikit beda), pakai beam_size lebih
+        besar untuk akurasi maksimal karena ini yang disimpan sebagai
+        transkrip final. Reset buffer internal untuk ucapan berikutnya.
+        """
+        self._audio = np.zeros(0, dtype=np.float32)
+        self._samples_since_last_run = 0
+        if not final_pcm_bytes:
+            return ""
+        return self._engine.transcribe_pcm16(
+            final_pcm_bytes, sample_rate=self._sample_rate, beam_size=settings.STT_BEAM_SIZE
+        )
+
+    def close(self):
+        """Dipanggil saat panggilan selesai -- tidak ada resource eksternal
+        yang perlu dilepas (beda dari sherpa-onnx yang punya native handle),
+        tapi disediakan untuk kompatibilitas API dengan pemanggilnya."""
+        self._audio = np.zeros(0, dtype=np.float32)
 
 
 # Lazy singleton -> supaya import module ini tidak langsung men-download model

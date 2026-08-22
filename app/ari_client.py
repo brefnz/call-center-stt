@@ -30,9 +30,8 @@ import json as _json
 
 from app.audio_capture import RTPReceiver, port_allocator
 from app.config import settings
-from app.pipeline import process_audio_segment, broadcast_live_transcript
-from app.sherpa_engine import LiveRecognizer
-from app.ws_manager import ws_manager  # FIX: dipakai buat nutup ws client saat call selesai
+from app.pipeline import process_transcript_text, broadcast_live_transcript, _save_debug_wav
+from app.stt_engine import StreamingSession, get_stt_engine
 
 logger = logging.getLogger("ari_client")
 
@@ -49,8 +48,8 @@ class CallSession:
         self.external_media_channel_ids: list[str] = []
         self.snoop_channel_ids: list[str] = []
         self.bridge_ids: list[str] = []  # satu bridge PER arah (customer, agent) -- lihat catatan di _setup_capture_for_channel
-        self.live_recognizers: dict[str, LiveRecognizer] = {}  # speaker_label -> sherpa-onnx recognizer (preview instan)
-        self.live_recognizer_locks: dict[str, asyncio.Lock] = {}  # kunci per speaker, jaga urutan frame tetap benar
+        self.streaming_sessions: dict[str, StreamingSession] = {}  # speaker_label -> StreamingSession (preview + final, 1 model whisper)
+        self.streaming_session_locks: dict[str, asyncio.Lock] = {}  # kunci per speaker, jaga urutan frame tetap benar
 
     async def stop(self):
         for recv in self.receivers.values():
@@ -59,8 +58,8 @@ class CallSession:
             _ari_delete(f"/channels/{ch_id}")
         for bridge_id in self.bridge_ids:
             _ari_delete(f"/bridges/{bridge_id}")
-        for recognizer in self.live_recognizers.values():
-            recognizer.close()
+        for sess in self.streaming_sessions.values():
+            sess.close()
 
 
 _sessions: dict[str, CallSession] = {}  # channel_id -> CallSession
@@ -68,35 +67,53 @@ _own_channel_ids: set[str] = set()  # semua snoop + externalMedia channel_id yan
 _agent_active_call: dict[str, str] = {}  # extension agent -> call_id (channel_id) yang lagi aktif
 
 
-async def _process_live_audio(sess: "CallSession", speaker: str, recognizer: LiveRecognizer, pcm: bytes, call_id: str):
+async def _process_live_audio(sess: "CallSession", speaker: str, session: StreamingSession, pcm: bytes, call_id: str):
     """
-    Jalankan LiveRecognizer.feed() di THREAD TERPISAH (run_in_executor) --
-    meskipun sherpa-onnx model int8 relatif ringan, inference ONNX tetap
-    makan waktu CPU nyata, dan ini dipanggil sangat sering (tiap frame
-    20ms). Kalau dijalankan sinkron langsung di event loop, event loop
-    bisa ke-block cukup lama pas audio banyak masuk -- ini yang bikin
-    WebSocket ke-disconnect & reconnect terus-terusan (ping/pong ke client
-    telat karena event loop sibuk), persis pola bug yang sama seperti yang
-    pernah terjadi di faster-whisper sebelumnya.
+    Jalankan StreamingSession.feed() di THREAD TERPISAH (run_in_executor) --
+    ini transcribe faster-whisper beneran (walau cuma buffer pendek +
+    beam_size=1/greedy), tetap makan waktu CPU nyata. Kalau dijalankan
+    sinkron langsung di event loop, event loop bisa ke-block cukup lama --
+    ini yang dulu bikin WebSocket ke-disconnect & reconnect terus-terusan
+    (ping/pong ke client telat karena event loop sibuk).
 
     Dikunci per speaker (bukan global) supaya frame-frame untuk SATU leg
-    audio yang sama tetap diproses berurutan (recognizer itu stateful,
-    kalau diproses tidak berurutan/bertumpukan hasilnya bisa kacau) --
-    tapi leg agent & customer tetap bisa jalan paralel karena locknya beda.
+    audio yang sama tetap diproses berurutan (StreamingSession itu
+    stateful, buffer internalnya bisa kacau kalau feed() dipanggil
+    bertumpukan) -- tapi leg agent & customer tetap bisa jalan paralel
+    karena locknya beda.
     """
-    lock = sess.live_recognizer_locks.setdefault(speaker, asyncio.Lock())
+    lock = sess.streaming_session_locks.setdefault(speaker, asyncio.Lock())
     async with lock:
         loop = asyncio.get_event_loop()
         try:
-            partial_text, final_text = await loop.run_in_executor(None, recognizer.feed, pcm)
+            preview_text = await loop.run_in_executor(None, session.feed, pcm)
         except Exception:
-            logger.exception("Gagal proses live audio (sherpa-onnx) speaker=%s", speaker)
+            logger.exception("Gagal proses live audio (streaming whisper) speaker=%s", speaker)
             return
 
-    if partial_text:
-        await broadcast_live_transcript(call_id, speaker, partial_text, is_final=False)
+    if preview_text:
+        await broadcast_live_transcript(call_id, speaker, preview_text, is_final=False)
+
+
+async def _process_final_segment(sess: "CallSession", speaker: str, session: StreamingSession, pcm: bytes, call_id: str):
+    """
+    Dipanggil SEKALI oleh VAD saat satu ucapan selesai. Pakai lock yang
+    SAMA dengan _process_live_audio supaya tidak bentrok dengan feed()
+    yang mungkin masih berjalan untuk ucapan yang sama.
+    """
+    _save_debug_wav(call_id, speaker, pcm, sample_rate=16000)
+
+    lock = sess.streaming_session_locks.setdefault(speaker, asyncio.Lock())
+    async with lock:
+        loop = asyncio.get_event_loop()
+        try:
+            final_text = await loop.run_in_executor(None, session.finalize, pcm)
+        except Exception:
+            logger.exception("Gagal proses transkrip final speaker=%s", speaker)
+            return
+
     if final_text:
-        await broadcast_live_transcript(call_id, speaker, final_text, is_final=True)
+        await process_transcript_text(call_id, speaker, final_text)
 
 
 def get_active_call_for_agent(extension: str) -> str | None:
@@ -184,17 +201,23 @@ async def _setup_capture_for_channel(
         _ari_post(f"/bridges/{bridge['id']}/addChannel", channel=snoop["id"])
         _ari_post(f"/bridges/{bridge['id']}/addChannel", channel=ext_media["id"])
 
-        if settings.SHERPA_ENABLED:
-            session.live_recognizers[speaker_label] = LiveRecognizer(sample_rate=16000)
+        # StreamingSession selalu dibuat (beda dari LiveRecognizer/sherpa
+        # dulu yang butuh SHERPA_ENABLED + model terpisah) -- cukup pakai
+        # model faster-whisper yang sama yang sudah pasti ter-load di
+        # get_stt_engine() (dipanggil sekali saja di app/main.py startup).
+        session.streaming_sessions[speaker_label] = StreamingSession(get_stt_engine(), sample_rate=16000)
 
-        async def on_segment(speaker: str, pcm: bytes, call_id=channel_id):
-            await process_audio_segment(call_id, speaker, pcm)
+        async def on_segment(speaker: str, pcm: bytes, call_id=channel_id, sess=session):
+            stream_sess = sess.streaming_sessions.get(speaker)
+            if stream_sess is None:
+                return
+            await _process_final_segment(sess, speaker, stream_sess, pcm, call_id)
 
         def on_live_audio(speaker: str, pcm: bytes, call_id=channel_id, sess=session):
-            recognizer = sess.live_recognizers.get(speaker)
-            if recognizer is None:
+            stream_sess = sess.streaming_sessions.get(speaker)
+            if stream_sess is None:
                 return
-            asyncio.create_task(_process_live_audio(sess, speaker, recognizer, pcm, call_id))
+            asyncio.create_task(_process_live_audio(sess, speaker, stream_sess, pcm, call_id))
 
         receiver = RTPReceiver(
             port=port,
@@ -295,23 +318,11 @@ async def _handle_event(event: dict):
         session = _sessions.pop(channel_id, None)
         if session:
             logger.info("Panggilan selesai, membersihkan resource call_id=%s", channel_id)
-
-            # FIX: hapus mapping agent->call_id DULU, SEBELUM await apapun
-            # (jadi dijamin sudah hilang sebelum kode lain sempat jalan).
-            # Ini yang bikin endpoint /active-call langsung berhenti
-            # ngarahin polling ke call yang baru saja berakhir ini.
+            await session.stop()
+            # Bersihkan juga mapping agent -> call_id kalau ini call yang sedang aktif
             for ext, active_call_id in list(_agent_active_call.items()):
                 if active_call_id == channel_id:
                     del _agent_active_call[ext]
-
-            await session.stop()
-
-            # FIX: ini bagian yang sebelumnya HILANG -- tanpa baris ini,
-            # WebSocket ke widget/Epic (/ws/{channel_id}) tidak pernah
-            # ditutup dari sisi backend, jadi widget tidak pernah dapat
-            # event `onclose` dan statusnya nyangkut "terhubung" terus
-            # meskipun panggilan sudah benar-benar selesai.
-            await ws_manager.close_call(channel_id)
 
 
 async def run_ari_listener():

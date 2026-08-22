@@ -25,6 +25,20 @@ class Settings:
     MEDIA_HOST: str = os.getenv("MEDIA_HOST", "127.0.0.1")
     MEDIA_PORT_RANGE_START: int = int(os.getenv("MEDIA_PORT_RANGE_START", "40000"))
     MEDIA_PORT_RANGE_END: int = int(os.getenv("MEDIA_PORT_RANGE_END", "40100"))
+    # FIX: HARUS 16000, bukan 8000 -- externalMedia di ari_client.py minta
+    # format="slin16" ke Asterisk, dan di penamaan Asterisk "slin16" itu
+    # artinya 16kHz (bukan cuma "16-bit"). Audio yang beneran mengalir
+    # SELALU 16000 Hz selama format itu gak diubah. Kalau nilai ini gak
+    # cocok, audio_capture.py salah ngitung durasi frame VAD (frame
+    # dianggap 20ms padahal cuma ~10ms audio asli) -- akibatnya VAD
+    # mendeteksi "akhir ucapan" ~2x lebih cepat dari SEGMENT_SILENCE_MS/
+    # SEGMENT_MAX_SECONDS yang di-set, yang bikin StreamingSession keseringan
+    # di-reset (finalize()) sebelum sempat ngumpulin cukup audio buat
+    # ngirim preview live pertama -- gejalanya: transkrip final tetap
+    # muncul, tapi preview/live gak pernah nongol. Kalau nanti BENERAN mau
+    # pindah ke narrowband 8kHz, ubah JUGA format="slin16" jadi "slin" di
+    # ari_client.py (_setup_capture_for_channel) -- dua-duanya harus jalan
+    # bareng, gak cukup ubah salah satu.
     AUDIO_SAMPLE_RATE: int = int(os.getenv("AUDIO_SAMPLE_RATE", "16000"))
 
     # Segmentasi VAD -- makin kecil, makin cepat terasa "real-time" (segmen
@@ -35,26 +49,40 @@ class Settings:
     SEGMENT_SILENCE_MS: int = int(os.getenv("SEGMENT_SILENCE_MS", "300"))  # jeda diam dianggap akhir ucapan
     SEGMENT_MAX_SECONDS: float = float(os.getenv("SEGMENT_MAX_SECONDS", "5.0"))  # batas atas paksa per segmen
 
-    # Interim/live transcript: selagi masih ngomong (belum ada jeda diam),
-    # kirim "cicilan" audio tiap INTERIM_FLUSH_MS untuk ditranskripsi sebagai
-    # teks SEMENTARA (bisa berubah), supaya kerasa langsung muncul alih-alih
-    # nunggu satu kalimat penuh selesai. INTERIM_WINDOW_SECONDS membatasi
-    # jumlah audio yang ditranskripsi ulang tiap kali (ambil beberapa detik
-    # terakhir saja) supaya beban CPU tidak makin berat kalau orangnya
-    # ngomong panjang tanpa jeda.
-    INTERIM_FLUSH_MS: int = int(os.getenv("INTERIM_FLUSH_MS", "1000"))
-    INTERIM_WINDOW_SECONDS: float = float(os.getenv("INTERIM_WINDOW_SECONDS", "3.0"))
+    # Level agresivitas webrtcvad, 0-3. Makin tinggi = makin ketat nge-
+    # filter "ini bukan ucapan" (bagus untuk kurangi halusinasi dari
+    # noise/dengung line telepon), TAPI makin gampang ikut motong
+    # konsonan pelan di awal/akhir kata (mis. "s", "f", "t") yang bikin
+    # STT salah tebak kata. Kalau transkrip sering salah padahal audio
+    # (cek debug_audio/*.wav) kedengaran jelas, coba turunkan ke 2 dulu.
+    VAD_AGGRESSIVENESS: int = int(os.getenv("VAD_AGGRESSIVENESS", "3"))
 
-    # --- sherpa-onnx (live/instan preview, streaming asli) ---
-    # Folder berisi encoder.onnx, decoder.onnx, joiner.onnx, tokens.txt
-    # (rename file hasil download sesuai nama itu persis -- lihat
-    # sherpa_engine.py untuk link download & instruksi lengkap)
-    SHERPA_MODEL_DIR: str = os.getenv("SHERPA_MODEL_DIR", "./models/sherpa-id-streaming")
-    SHERPA_ENABLED: bool = os.getenv("SHERPA_ENABLED", "true").lower() == "true"
-    SHERPA_NUM_THREADS: int = int(os.getenv("SHERPA_NUM_THREADS", "2"))
+    # STT streaming (preview real-time) -- lihat StreamingSession di
+    # stt_engine.py. Ini menggantikan sherpa-onnx: SATU model faster-
+    # whisper dipakai baik untuk preview (re-run tiap
+    # STT_STREAM_CHUNK_SECONDS detik, beam_size=1/greedy) MAUPUN final
+    # (sekali di akhir ucapan, beam_size=STT_BEAM_SIZE). Makin kecil nilai
+    # ini, makin sering preview di-update (makin "real-time" kerasanya),
+    # tapi makin sering juga model dipanggil ulang (beban CPU naik).
+    STT_STREAM_CHUNK_SECONDS: float = float(os.getenv("STT_STREAM_CHUNK_SECONDS", "1"))
+
+    # FIX: batas darurat panjang buffer PREVIEW di StreamingSession.feed().
+    # Beda dari SEGMENT_MAX_SECONDS (itu batas audio FINAL yang disimpan ke
+    # DB, dikontrol VAD di audio_capture.py) -- ini khusus buat buffer
+    # internal preview live. Sebelumnya buffer ini TIDAK dibatasi sama
+    # sekali: kalau speaker ngomong panjang tanpa jeda, tiap
+    # STT_STREAM_CHUNK_SECONDS whisper harus re-transcribe SELURUH audio
+    # dari awal ucapan, makin lama makin berat (biaya tumbuh gak
+    # terkendali). Sekarang buffer preview dipotong, cuma nyimpen
+    # STT_STREAM_MAX_BUFFER_SECONDS detik TERAKHIR -- preview mungkin
+    # "lupa" kata-kata di awal kalimat yang sangat panjang, tapi biaya
+    # re-transcribe-nya jadi konstan (gak terus membengkak). Ini gak
+    # mempengaruhi hasil FINAL (itu tetap dari finalize(), pakai audio
+    # utuh dari VAD).
+    STT_STREAM_MAX_BUFFER_SECONDS: float = float(os.getenv("STT_STREAM_MAX_BUFFER_SECONDS", "8.0"))
 
     # STT (faster-whisper)
-    STT_MODEL_SIZE: str = os.getenv("STT_MODEL_SIZE", "large-v3")
+    STT_MODEL_SIZE: str = os.getenv("STT_MODEL_SIZE", "small")
     STT_DEVICE: str = os.getenv("STT_DEVICE", "cpu")
     STT_COMPUTE_TYPE: str = os.getenv("STT_COMPUTE_TYPE", "int8")
     STT_LANGUAGE: str = os.getenv("STT_LANGUAGE", "id")
@@ -66,6 +94,12 @@ class Settings:
     # lebih (proporsional ke ukuran model), 2 biasanya cukup untuk pola
     # pemakaian kita (1 interim + 1 final berbarengan per panggilan aktif).
     STT_NUM_WORKERS: int = int(os.getenv("STT_NUM_WORKERS", "2"))
+    # beam_size untuk transkrip FINAL (yang dipakai KB search & disimpan
+    # ke DB) -- default faster-whisper adalah 5. Di CPU (apalagi tanpa
+    # GPU), turunkan ke 2-3 untuk latensi jauh lebih baik dengan sedikit
+    # trade-off akurasi. 1 = greedy decoding, tercepat tapi paling kurang
+    # akurat -- biasanya dipakai khusus untuk interim/preview, bukan final.
+    STT_BEAM_SIZE: int = int(os.getenv("STT_BEAM_SIZE", "3"))
 
     # KB search
     KB_TOP_K: int = int(os.getenv("KB_TOP_K", "5"))

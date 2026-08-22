@@ -14,8 +14,8 @@ import os
 import wave
 
 from app import db
+from app.config import settings
 from app.kb_search import kb_search_engine
-from app.stt_engine import get_stt_engine
 from app.ws_manager import ws_manager
 
 logger = logging.getLogger("pipeline")
@@ -30,60 +30,42 @@ if DEBUG_SAVE_WAV:
 
 
 def _save_debug_wav(call_id: str, speaker: str, pcm_bytes: bytes, sample_rate: int):
-    safe_call_id = call_id.replace(":", "_").replace("/", "_")
-    fname = f"{DEBUG_WAV_DIR}/{safe_call_id}_{speaker}_{len(pcm_bytes)}.wav"
-    with wave.open(fname, "wb") as wf:
-        wf.setnchannels(1)
-        wf.setsampwidth(2)  # 16-bit
-        wf.setframerate(sample_rate)
-        wf.writeframes(pcm_bytes)
-    logger.info("DEBUG: segmen audio disimpan ke %s", fname)
-
-
-async def process_audio_segment(call_id: str, speaker: str, pcm_bytes: bytes):
-    """Dipanggil setiap satu segmen ucapan (hasil VAD) selesai direkam."""
-    if DEBUG_SAVE_WAV:
-        try:
-            _save_debug_wav(call_id, speaker, pcm_bytes, sample_rate=16000)
-        except Exception:
-            logger.exception("DEBUG: gagal simpan wav")
-
-    stt = get_stt_engine()
-    # PENTING: transcribe_pcm16 itu CPU-bound & blocking (menjalankan model
-    # Whisper). Kalau dipanggil langsung di sini, dia akan mem-block SELURUH
-    # event loop asyncio -- termasuk socket UDP yang lagi nerima paket RTP
-    # audio BARU secara bersamaan. Akibatnya paket yang datang PAS proses
-    # transkripsi berjalan bisa didrop di level OS (buffer socket penuh),
-    # yang kedengar sebagai suara kresek/putus-putus tepat pas ada yang
-    # ngomong terus-menerus. run_in_executor menjalankannya di thread
-    # terpisah supaya event loop tetap bebas menerima audio.
-    loop = asyncio.get_event_loop()
-    text = await loop.run_in_executor(None, stt.transcribe_pcm16, pcm_bytes, 16000)
-    text = text.strip()
-    if not text:
+    """
+    Dipanggil dari app/ari_client.py._process_final_segment tiap satu
+    segmen ucapan (hasil VAD) selesai -- dipindah ke sini (bukan lagi
+    dari process_audio_segment, karena fungsi itu sudah dihapus setelah
+    pindah ke StreamingSession, lihat app/stt_engine.py) supaya dev bisa
+    dengerin langsung hasil rekaman tiap ucapan untuk debugging kualitas
+    audio (lihat riwayat diagnosis reconnect loop & kualitas audio).
+    """
+    if not DEBUG_SAVE_WAV or not pcm_bytes:
         return
-
-    logger.info("[%s][%s] %s", call_id, speaker, text)
-
-    await process_transcript_text(call_id, speaker, text)
+    try:
+        safe_call_id = call_id.replace(":", "_").replace("/", "_")
+        fname = f"{DEBUG_WAV_DIR}/{safe_call_id}_{speaker}_{len(pcm_bytes)}.wav"
+        with wave.open(fname, "wb") as wf:
+            wf.setnchannels(1)
+            wf.setsampwidth(2)  # 16-bit
+            wf.setframerate(sample_rate)
+            wf.writeframes(pcm_bytes)
+        logger.info("DEBUG: segmen audio disimpan ke %s", fname)
+    except Exception:
+        logger.exception("DEBUG: gagal simpan wav")
 
 
 async def broadcast_live_transcript(call_id: str, speaker: str, text: str, is_final: bool):
     """
-    Broadcast hasil dari Vosk (preview instan) -- BEDA dari
-    process_transcript_text yang menyimpan ke DB dan memicu KB search.
-    Fungsi ini murni untuk tampilan real-time di sisi Epic/CRM, dijalankan
-    per potongan kecil audio yang terus mengalir (lihat vosk_engine.py &
-    ari_client.py). Vosk sengaja TIDAK dipakai untuk memicu KB search --
-    akurasinya lebih rendah dibanding faster-whisper, jadi keputusan
-    "ucapan apa yang resmi dikatakan customer" tetap dari
-    process_transcript_text (dipanggil dari process_audio_segment).
+    Broadcast hasil PREVIEW dari StreamingSession (lihat stt_engine.py) --
+    BEDA dari process_transcript_text yang menyimpan ke DB dan memicu KB
+    search. Fungsi ini murni untuk tampilan real-time yang terus "nyempurna"
+    di sisi Epic/CRM (mis. "halo" -> "halo selamat" -> "halo selamat pagi"),
+    dipanggil tiap StreamingSession.feed() menghasilkan hipotesis baru.
 
-    is_final=False -> Vosk masih menganggap ucapan berlangsung (partial
-        result, bisa berubah di panggilan berikutnya).
-    is_final=True  -> endpointing internal Vosk mendeteksi ucapan selesai
-        (versi akhir MENURUT VOSK -- tetap bukan yang dipakai KB search,
-        cuma dikunci tampilannya di UI supaya tidak "loncat-loncat" lagi).
+    is_final selalu False dari StreamingSession.feed() (preview masih bisa
+    berubah) -- parameter ini dipertahankan untuk kompatibilitas pesan WS
+    yang sudah ada (tipe "transcript_live_final" disediakan kalau nanti
+    ada sumber lain yang perlu mengunci tampilan tanpa lewat
+    process_transcript_text).
     """
     await ws_manager.broadcast(call_id, {
         "type": "transcript_interim" if not is_final else "transcript_live_final",

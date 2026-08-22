@@ -25,6 +25,7 @@ import threading
 from dataclasses import dataclass, field
 from typing import Callable, Optional
 
+import numpy as np
 import webrtcvad
 
 from app.config import settings
@@ -38,8 +39,6 @@ BYTES_PER_SAMPLE = 2  # 16-bit PCM
 # lihat app/config.py untuk penjelasan trade-off nilai ini.
 SILENCE_FRAMES_TO_END_SEGMENT = max(1, round(settings.SEGMENT_SILENCE_MS / FRAME_MS))
 MAX_SEGMENT_FRAMES = max(1, round(settings.SEGMENT_MAX_SECONDS * 1000 / FRAME_MS))
-INTERIM_FLUSH_FRAMES = max(1, round(settings.INTERIM_FLUSH_MS / FRAME_MS))
-INTERIM_WINDOW_FRAMES = max(1, round(settings.INTERIM_WINDOW_SECONDS * 1000 / FRAME_MS))
 
 # Jitter buffer: RTP jalan di atas UDP, yang TIDAK menjamin urutan paket
 # sampai. Kalau audio langsung disambung sesuai urutan KEDATANGAN (bukan
@@ -48,8 +47,8 @@ INTERIM_WINDOW_FRAMES = max(1, round(settings.INTERIM_WINDOW_SECONDS * 1000 / FR
 # menahan sebentar paket yang masuk, susun ulang berdasar sequence number,
 # baru dilepas ke VAD -- correctness diprioritaskan di atas latensi sekecil
 # mungkin (~beberapa puluh ms tambahan, tidak masalah untuk STT non-live-caption).
-JITTER_BUFFER_SIZE = 20  # tahan sampai 20 paket (~400ms) sebelum mulai paksa lompat
-JITTER_MAX_WAIT_PACKETS = 30  # kalau satu seq "hilang" > ini, anggap benar2 hilang, lanjut
+JITTER_BUFFER_SIZE = 5  # tahan sampai 20 paket (~400ms) sebelum mulai paksa lompat
+JITTER_MAX_WAIT_PACKETS = 10  # kalau satu seq "hilang" > ini, anggap benar2 hilang, lanjut
 
 
 def _parse_rtp_header(data: bytes):
@@ -128,17 +127,67 @@ class PortAllocator:
 port_allocator = PortAllocator(settings.MEDIA_PORT_RANGE_START, settings.MEDIA_PORT_RANGE_END)
 
 
+class _SimpleAGC:
+    """
+    Automatic Gain Control ringan. Kita sudah verifikasi lewat file .wav
+    debug bahwa audio dari Asterisk (snoop channel) datang dengan
+    amplitudo SANGAT RENDAH (puncak cuma ~6.5% dari skala penuh 16-bit).
+    Level segitu bikin webrtcvad (yang sensitif ke energi sinyal) gampang
+    SALAH nganggep ucapan beneran sebagai diam/noise -- terutama di level
+    agresivitas tinggi (VAD_AGGRESSIVENESS=3) -- sehingga VAD tidak pernah
+    trigger sama sekali walau orangnya beneran ngomong.
+
+    AGC ini menaikkan volume secara ADAPTIF menuju target level, sebelum
+    audio masuk ke VAD maupun STT. Pakai exponential moving peak (bukan
+    gain tetap) supaya:
+      - Gain menyesuaikan otomatis ke level suara tiap panggilan/line
+        (beda panggilan bisa beda level asalnya).
+      - Perubahan gain HALUS antar frame (tidak "kaget"/pumping tiap
+        frame yang bisa merusak kualitas audio).
+      - max_gain dibatasi supaya audio yang MEMANG diam (noise lantai)
+        tidak ikut diperkeras jadi terdengar seperti "ada suara" palsu.
+    """
+
+    def __init__(self, target_peak: float = 22000.0, max_gain: float = 25.0, floor: float = 60.0):
+        self.target_peak = target_peak
+        self.max_gain = max_gain
+        self.floor = floor
+        self._smoothed_peak = floor
+
+    def process(self, frame: bytes) -> bytes:
+        if not frame:
+            return frame
+        samples = np.frombuffer(frame, dtype=np.int16).astype(np.float32)
+        peak = float(np.abs(samples).max()) if samples.size else 0.0
+
+        # Exponential smoothing (alpha kecil = adaptasi lembut, gain gak
+        # "kaget" tiap frame individual)
+        alpha = 0.2
+        self._smoothed_peak = max(self.floor, alpha * peak + (1 - alpha) * self._smoothed_peak)
+        gain = min(self.max_gain, self.target_peak / self._smoothed_peak)
+
+        boosted = samples * gain
+        np.clip(boosted, -32768, 32767, out=boosted)
+        return boosted.astype(np.int16).tobytes()
+
+
 @dataclass
 class _VADState:
-    # Level 3 (paling ketat/agresif dari 0-3): kurangi noise/diam yang
-    # salah kedeteksi sebagai "ada yang ngomong" -- ini penyebab utama
-    # transkrip ngaco/halusinasi ("terima kasih kerana menonton" dst)
-    # yang muncul dari segmen yang isinya sebenarnya bukan ucapan jelas.
-    vad: webrtcvad.Vad = field(default_factory=lambda: webrtcvad.Vad(3))
+    # Level agresivitas dibaca dari settings (.env) supaya bisa dituning
+    # tanpa ubah kode -- lihat app/config.py untuk penjelasan trade-off-nya
+    # (makin tinggi = makin ketat filter noise, tapi makin gampang ikut
+    # motong konsonan pelan di awal/akhir kata).
+    vad: webrtcvad.Vad = field(default_factory=lambda: webrtcvad.Vad(settings.VAD_AGGRESSIVENESS))
+    agc: _SimpleAGC = field(default_factory=_SimpleAGC)
     buffer: bytearray = field(default_factory=bytearray)
     speech_frames: list = field(default_factory=list)
     silence_run: int = 0
     in_speech: bool = False
+    # Diagnostik: berapa paket RTP total diterima & berapa frame yang
+    # kedeteksi VAD sebagai ucapan -- di-log berkala supaya gampang cek
+    # apakah audio beneran nyampe & apakah VAD beneran mendeteksi apa pun.
+    packets_received: int = 0
+    frames_detected_speech: int = 0
     # Jitter buffer: seq_num -> payload_bytes, untuk paket yang sudah
     # diterima tapi belum dilepas ke VAD karena menunggu paket lain yang
     # seharusnya datang lebih dulu (berdasar sequence number).
@@ -177,6 +226,13 @@ class RTPAudioProtocol(asyncio.DatagramProtocol):
         if not payload:
             return
         payload = _rtp_payload_to_pcm_le(payload)
+        payload = self._state.agc.process(payload)
+        self._state.packets_received += 1
+        if self._state.packets_received % 250 == 0:
+            logger.info(
+                "Diagnostik audio: %d paket diterima, %d frame kedeteksi ucapan sejauh ini",
+                self._state.packets_received, self._state.frames_detected_speech,
+            )
         self._push_jitter(seq_num, payload)
 
     def _push_jitter(self, seq_num: int, payload: bytes):
@@ -270,17 +326,19 @@ class RTPAudioProtocol(asyncio.DatagramProtocol):
                 st.in_speech = True
                 st.silence_run = 0
                 st.speech_frames.append(frame)
+                st.frames_detected_speech += 1
             elif st.in_speech:
                 st.silence_run += 1
                 st.speech_frames.append(frame)  # simpan sedikit ekor untuk konteks
 
-            # Vosk (kalau aktif) dikasih makan SETIAP frame, apa adanya,
-            # tanpa peduli VAD kita bilang ini speech atau bukan -- Vosk
-            # punya endpointing sendiri yang lebih pas buat streaming.
-            # Ini yang menggantikan peran "interim" versi Whisper lama
-            # (yang sekarang dihapus, karena Vosk jauh lebih cocok untuk
-            # peran preview instan ini).
-            if self.on_live_audio is not None:
+            # on_live_audio dipanggil HANYA selama speaker terdeteksi
+            # sedang ngomong (in_speech) -- persis selaras dengan frame
+            # yang masuk speech_frames di bawah. Ini penting untuk
+            # StreamingSession (lihat stt_engine.py): buffer preview-nya
+            # jadi PERSIS prefix dari audio yang nanti di-finalize, tanpa
+            # ikut kebawa audio diam panjang di antar-ucapan yang cuma
+            # buang-buang waktu CPU kalau ikut ditranscribe.
+            if self.on_live_audio is not None and st.in_speech:
                 self.on_live_audio(frame)
 
             segment_too_long = len(st.speech_frames) >= MAX_SEGMENT_FRAMES
